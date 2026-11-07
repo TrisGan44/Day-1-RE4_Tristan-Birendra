@@ -29,7 +29,7 @@
   body[data-mode="draw"]  #board { cursor: crosshair; }
   body[data-mode="erase"] #board { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22'%3E%3Ccircle cx='11' cy='11' r='9.5' fill='none' stroke='%23888' stroke-width='1.2'/%3E%3C/svg%3E") 11 11, crosshair; }
   body.panning #board { cursor: grabbing; }
-  #ink { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #ink { position: absolute; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
 
   /* "dunia": ikut bergeser lewat transform; titik (0,0) dunia ada di sini */
   #world { position: absolute; left: 0; top: 0; width: 0; height: 0; will-change: transform; }
@@ -47,6 +47,15 @@
   }
   /* di mode draw/erase, blok teks tidak menangkap pointer supaya coretan/hapus bisa lewat di atasnya */
   body[data-mode="draw"] .note, body[data-mode="erase"] .note { pointer-events: none; }
+
+  /* ---------- gambar: lapisan sendiri di bawah canvas supaya coretan tampil di atas gambar ---------- */
+  #pics { position: absolute; left: 0; top: 0; width: 0; height: 0; will-change: transform; }
+  .pic {
+    position: absolute; display: block; cursor: grab;
+    -webkit-user-drag: none; -webkit-user-select: none; user-select: none;
+  }
+  body.panning .pic { cursor: grabbing; }
+  body[data-mode="draw"] .pic, body[data-mode="erase"] .pic { pointer-events: none; }
 
   /* ---------- petunjuk samar di tengah ---------- */
   #hint {
@@ -73,6 +82,7 @@
 <body data-mode="write">
 
 <div id="board">
+  <div id="pics"></div>
   <canvas id="ink"></canvas>
   <div id="world"></div>
 </div>
@@ -98,11 +108,14 @@
   const ERASE_R = 9;         // radius penghapus
   const TAP_SLOP = 4;        // geseran maksimum yang masih dihitung sebagai "klik"
   const UNDO_LIMIT = 200;
+  const IMG_PREFIX = 'gultik.img.';   // tiap gambar disimpan di kunci sendiri (data URL)
+  const IMG_MAX_PX = 1200;            // gambar diperkecil ke lebar maksimal ini sebelum disimpan
 
   const board = document.getElementById('board');
   const canvas = document.getElementById('ink');
   const ctx = canvas.getContext('2d');
   const world = document.getElementById('world');
+  const pics = document.getElementById('pics');
   const hint = document.getElementById('hint');
   const bar = document.getElementById('bar');
   const undoBtn = document.getElementById('undo');
@@ -110,7 +123,9 @@
   let view = { x: 0, y: 0 };          // posisi dunia di layar: layar = dunia + view
   const notes = new Map();            // id -> { id, x, y, text, el }
   let strokes = [];                   // [{ id, p: [[x,y],...], b: [minx,miny,maxx,maxy] }]
-  const undoStack = [];               // { type:'stroke', id } | { type:'erase', strokes:[], notes:[] }
+  const images = new Map();           // id -> { id, x, y, w, h, src, el, stored }
+  const undoStack = [];               // { type:'stroke', id } | { type:'add', ids } | { type:'erase', strokes, notes, images }
+  let lastClick = null;               // [x,y] dunia: posisi klik terakhir (untuk menempel gambar)
   let mode = 'write';                 // write | draw | erase
   let dpr = 1;
   let ink = '#26231f';
@@ -124,14 +139,34 @@
   function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 400); }
   function saveNow() {
     clearTimeout(saveTimer);
+    for (const im of images.values()) if (!im.stored) storeImage(im);   // coba lagi yang dulu gagal
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
         v: 1,
         view: { x: view.x, y: view.y },
         notes: [...notes.values()].map(n => ({ id: n.id, x: n.x, y: n.y, text: n.text })),
         strokes: strokes.map(s => ({ id: s.id, p: s.p })),
+        images: [...images.values()].map(i => ({ id: i.id, x: i.x, y: i.y, w: i.w, h: i.h })),
       }));
     } catch (_) { /* penyimpanan penuh/diblokir: diam saja */ }
+  }
+
+  // data gambar disimpan terpisah, jadi papan utama (teks & coretan) tetap tersimpan walau gambar tak muat
+  function storeImage(im) {
+    try { localStorage.setItem(IMG_PREFIX + im.id, im.src); im.stored = true; }
+    catch (_) { im.stored = false; }
+  }
+
+  // buang data gambar yang sudah tidak dipakai papan (dijalankan saat halaman dimuat)
+  function dropUnusedImages(keep) {
+    try {
+      const dead = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(IMG_PREFIX) && !keep.has(k.slice(IMG_PREFIX.length))) dead.push(k);
+      }
+      for (const k of dead) localStorage.removeItem(k);
+    } catch (_) {}
   }
 
   const num = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
@@ -152,6 +187,16 @@
           strokes.push({ id: s.id || uid(), p, b: bboxOf(p) });
         }
       }
+      const keep = new Set();
+      for (const m of d.images || []) {
+        if (!m || typeof m.id !== 'string') continue;
+        let src = null;
+        try { src = localStorage.getItem(IMG_PREFIX + m.id); } catch (_) {}
+        if (!src) continue;                     // datanya dulu gagal tersimpan: lewati
+        keep.add(m.id);
+        addImage(num(m.x), num(m.y), num(m.w) || 200, num(m.h) || 150, src, m.id, true);
+      }
+      dropUnusedImages(keep);
     } catch (_) { /* data rusak: mulai dari papan kosong */ }
   }
 
@@ -208,10 +253,14 @@
       n.text = plainSupported ? el.textContent : el.innerText;
       updateHint(); scheduleSave();
     });
-    // tempel sebagai teks polos saja
+    // tempel sebagai teks polos; kalau clipboard hanya berisi gambar, jadikan blok gambar
     el.addEventListener('paste', e => {
       e.preventDefault();
-      document.execCommand('insertText', false, (e.clipboardData || window.clipboardData).getData('text'));
+      const dt = e.clipboardData || window.clipboardData;
+      const text = dt.getData('text');
+      if (text) { document.execCommand('insertText', false, text); return; }
+      const files = imageFiles(dt);
+      if (files.length) pasteImages(files);
     });
     // blok kosong otomatis terhapus saat kehilangan fokus
     el.addEventListener('blur', () => {
@@ -236,7 +285,113 @@
   const blurActive = () => { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); };
 
   // petunjuk hilang begitu ada isi di papan
-  function updateHint() { hint.classList.toggle('gone', notes.size > 0 || strokes.length > 0); }
+  function updateHint() { hint.classList.toggle('gone', notes.size > 0 || strokes.length > 0 || images.size > 0); }
+
+  /* =====================================================================
+   * 3b. gambar: tempel (Ctrl/Cmd+V), drag & drop, diperkecil sebelum disimpan
+   * ===================================================================== */
+  function addImage(x, y, w, h, src, id = uid(), stored = false) {
+    const el = new Image();
+    el.className = 'pic';
+    el.draggable = false;
+    el.alt = '';
+    el.dataset.id = id;
+    el.src = src;
+    Object.assign(el.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px' });
+    const im = { id, x, y, w, h, src, el, stored };
+    images.set(id, im);
+    pics.appendChild(el);
+    updateHint();
+    return im;
+  }
+
+  function removeImage(id) {
+    const im = images.get(id);
+    if (!im) return;
+    images.delete(id);
+    im.el.remove();
+    updateHint();
+  }
+
+  // ambil file gambar dari clipboard / dataTransfer
+  function imageFiles(dt) {
+    const out = [];
+    if (!dt) return out;
+    for (const it of dt.items || []) {
+      if (it.kind === 'file' && it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) out.push(f); }
+    }
+    if (!out.length) for (const f of dt.files || []) if (f.type.startsWith('image/')) out.push(f);
+    return out;
+  }
+
+  const readDataURL = blob => new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result); r.onerror = rej;
+    r.readAsDataURL(blob);
+  });
+  const loadImg = src => new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i); i.onerror = rej;
+    i.src = src;
+  });
+
+  // perkecil ke lebar maks IMG_MAX_PX lalu kompres; gambar kecil/GIF dibiarkan apa adanya
+  async function prepareImage(blob) {
+    const orig = await readDataURL(blob);
+    const img = await loadImg(orig);
+    const nw = img.naturalWidth || 300, nh = img.naturalHeight || 150;
+    const s = Math.min(1, IMG_MAX_PX / nw);
+    const w = Math.max(1, Math.round(nw * s)), h = Math.max(1, Math.round(nh * s));
+    if (s === 1 && (blob.type === 'image/gif' || orig.length < 200000)) return { src: orig, w, h };
+    let out = orig;
+    try {
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const cx = c.getContext('2d');
+      cx.imageSmoothingQuality = 'high';
+      cx.drawImage(img, 0, 0, w, h);
+      out = c.toDataURL('image/webp', 0.85);
+      if (!out.startsWith('data:image/webp')) {           // browser tanpa encoder webp
+        out = c.toDataURL('image/png');
+        if (out.length > 1.5e6) {                          // png terlalu besar: jpeg dengan latar putih
+          cx.globalCompositeOperation = 'destination-over';
+          cx.fillStyle = '#fff'; cx.fillRect(0, 0, w, h);
+          out = c.toDataURL('image/jpeg', 0.85);
+        }
+      }
+    } catch (_) { out = orig; }
+    if (s === 1 && out.length >= orig.length) out = orig;
+    return { src: out, w, h };
+  }
+
+  const remPx = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+
+  // taruh gambar di (wx,wy) dunia: pojok kiri-atas di titik itu, atau berpusat di sana
+  async function placeImages(files, wx, wy, centered) {
+    const ids = [], maxW = 30 * remPx();
+    for (const f of files) {
+      let d;
+      try { d = await prepareImage(f); } catch (_) { continue; }   // bukan gambar yang valid
+      const k = Math.min(1, maxW / d.w);
+      const w = Math.round(d.w * k), h = Math.round(d.h * k), off = ids.length * 24;
+      const x = Math.round(centered ? wx - w / 2 : wx) + off;
+      const y = Math.round(centered ? wy - h / 2 : wy) + off;
+      const im = addImage(x, y, w, h, d.src);
+      storeImage(im);
+      ids.push(im.id);
+    }
+    if (ids.length) { pushUndo({ type: 'add', ids }); scheduleSave(); }
+  }
+
+  // tempel: di posisi klik terakhir (kalau masih terlihat), selain itu di tengah layar
+  function pasteImages(files) {
+    if (lastClick) {
+      const sx = lastClick[0] + view.x, sy = lastClick[1] + view.y;
+      if (sx >= 0 && sx <= innerWidth && sy >= 0 && sy <= innerHeight) return placeImages(files, lastClick[0], lastClick[1], false);
+    }
+    const [cx, cy] = toWorld(innerWidth / 2, innerHeight / 2);
+    return placeImages(files, cx, cy, true);
+  }
 
   /* =====================================================================
    * 4. canvas: coretan (hanya bagian yang terlihat yang digambar)
@@ -262,7 +417,7 @@
   function draw() {
     rafId = 0;
     const rx = Math.round(view.x), ry = Math.round(view.y);
-    world.style.transform = `translate(${rx}px, ${ry}px)`;
+    world.style.transform = pics.style.transform = `translate(${rx}px, ${ry}px)`;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(dpr, 0, 0, dpr, rx * dpr, ry * dpr);
@@ -308,9 +463,12 @@
     if (!a) return;
     if (a.type === 'stroke') {
       strokes = strokes.filter(s => s.id !== a.id);
-    } else {                                    // batalkan penghapusan: kembalikan coretan & teks
+    } else if (a.type === 'add') {              // batalkan gambar yang baru ditempel
+      for (const id of a.ids) removeImage(id);
+    } else {                                    // batalkan penghapusan: kembalikan coretan, teks & gambar
       for (const r of a.strokes) strokes.splice(Math.min(r.idx, strokes.length), 0, r.s);
       for (const n of a.notes) addNote(n.x, n.y, n.text, n.id);
+      for (const m of a.images || []) addImage(m.x, m.y, m.w, m.h, m.src, m.id, m.stored);
     }
     updateHint(); requestDraw(); scheduleSave();
   }
@@ -356,13 +514,22 @@
       const hit = pts.some(([px, py]) => px >= r.x0 - 4 && px <= r.x1 + 4 && py >= r.y0 - 4 && py <= r.y1 + 4);
       if (hit) { rec.notes.push({ id: n.id, x: n.x, y: n.y, text: n.text }); removeNote(n.id); changed = true; }
     }
+
+    for (const im of [...images.values()]) {
+      const x0 = im.x, y0 = im.y, x1 = im.x + im.w, y1 = im.y + im.h;
+      if (x1 < minx || x0 > maxx || y1 < miny || y0 > maxy) continue;
+      if (pts.some(([px, py]) => px >= x0 && px <= x1 && py >= y0 && py <= y1)) {
+        rec.images.push({ id: im.id, x: im.x, y: im.y, w: im.w, h: im.h, src: im.src, stored: im.stored });
+        removeImage(im.id); changed = true;
+      }
+    }
     if (changed) { updateHint(); requestDraw(); }
   }
 
   function commitErase(rec) {
-    if (!rec.strokes.length && !rec.notes.length) return;
+    if (!rec.strokes.length && !rec.notes.length && !rec.images.length) return;
     rec.strokes.sort((a, b) => a.idx - b.idx);   // dikembalikan dari indeks kecil ke besar
-    pushUndo({ type: 'erase', strokes: rec.strokes, notes: rec.notes });
+    pushUndo({ type: 'erase', strokes: rec.strokes, notes: rec.notes, images: rec.images });
     scheduleSave();
   }
 
@@ -381,6 +548,7 @@
     const add = (x0, y0, x1, y1) => { b = b ? [Math.min(b[0], x0), Math.min(b[1], y0), Math.max(b[2], x1), Math.max(b[3], y1)] : [x0, y0, x1, y1]; };
     for (const n of notes.values()) { const r = noteRect(n); add(r.x0, r.y0, r.x1, r.y1); }
     for (const s of strokes) add(s.b[0], s.b[1], s.b[2], s.b[3]);
+    for (const im of images.values()) add(im.x, im.y, im.x + im.w, im.y + im.h);
     let tx = 0, ty = 0;
     if (b) {
       const M = 48, w = b[2] - b[0], h = b[3] - b[1];
@@ -419,6 +587,11 @@
     if (m !== 'write') blurActive();
   }
 
+  function moveImage(im, x, y) {
+    im.x = x; im.y = y;
+    im.el.style.left = x + 'px'; im.el.style.top = y + 'px';
+  }
+
   function endGesture(cancel) {
     if (!g) return;
     const gg = g; g = null;
@@ -427,6 +600,9 @@
     if (gg.kind === 'draw') {
       if (cancel) { strokes = strokes.filter(s => s !== gg.stroke); requestDraw(); }
       else { pushUndo({ type: 'stroke', id: gg.stroke.id }); scheduleSave(); }
+    } else if (gg.kind === 'move') {
+      if (cancel) moveImage(gg.im, gg.ox, gg.oy);   // dibatalkan (mis. jari kedua): kembali ke posisi awal
+      else if (gg.moved) scheduleSave();
     } else if (gg.kind === 'erase') {
       commitErase(gg.rec);
     } else if (gg.kind === 'tap' && !cancel) {
@@ -465,11 +641,17 @@
 
     // Ctrl + klik/seret = hapus sekali gerakan; ujung stylus bagian penghapus juga
     const tool = (e.ctrlKey || e.button === 5 || (e.buttons & 32)) ? 'erase' : mode;
+    const [wx, wy] = toWorld(e.clientX, e.clientY);
+    lastClick = [Math.round(wx), Math.round(wy)];
     if (tool === 'write' && e.target.closest('.note')) return;   // biarkan browser mengedit teks
 
     try { board.setPointerCapture(e.pointerId); } catch (_) {}
-    const [wx, wy] = toWorld(e.clientX, e.clientY);
-    if (tool === 'write') {
+    const pic = tool === 'write' && e.target.closest('.pic');
+    if (pic && images.has(pic.dataset.id)) {    // seret gambar di mode write: pindahkan
+      blurActive();
+      const im = images.get(pic.dataset.id);
+      g = { id: e.pointerId, kind: 'move', im, sx: e.clientX, sy: e.clientY, ox: im.x, oy: im.y, moved: false };
+    } else if (tool === 'write') {
       blurActive();
       g = { id: e.pointerId, kind: 'tap', sx: e.clientX, sy: e.clientY, lx: e.clientX, ly: e.clientY };
     } else if (tool === 'draw') {
@@ -480,7 +662,7 @@
       g = { id: e.pointerId, kind: 'draw', stroke };
       updateHint(); requestDraw();
     } else {
-      g = { id: e.pointerId, kind: 'erase', lx: wx, ly: wy, rec: { strokes: [], notes: [] } };
+      g = { id: e.pointerId, kind: 'erase', lx: wx, ly: wy, rec: { strokes: [], notes: [], images: [] } };
       paintToolbar('erase');
       eraseSegment(wx, wy, wx, wy, g.rec);
     }
@@ -504,7 +686,12 @@
       g.kind = 'pan';                           // diseret: jadi geser papan, bukan blok teks
       document.body.classList.add('panning');
     }
-    if (g.kind === 'pan') {
+    if (g.kind === 'move') {
+      const dx = e.clientX - g.sx, dy = e.clientY - g.sy;
+      if (!g.moved && Math.hypot(dx, dy) <= TAP_SLOP) return;
+      if (!g.moved) { g.moved = true; document.body.classList.add('panning'); }
+      moveImage(g.im, Math.round(g.ox + dx), Math.round(g.oy + dy));
+    } else if (g.kind === 'pan') {
       panBy(e.clientX - g.lx, e.clientY - g.ly);
       g.lx = e.clientX; g.ly = e.clientY;
     } else if (g.kind === 'draw') {
@@ -550,6 +737,45 @@
   }, { passive: false });
 
   /* =====================================================================
+   * 8b. tempel & drag-drop gambar
+   * ===================================================================== */
+  let pasteFallback = 0;
+  window.addEventListener('paste', e => {
+    clearTimeout(pasteFallback);
+    if (e.defaultPrevented || activeNote()) return;   // di blok teks: ditangani handler blok teks
+    const files = imageFiles(e.clipboardData);
+    if (files.length) { e.preventDefault(); pasteImages(files); }
+  });
+
+  // cadangan untuk browser yang tidak mengirim event paste di luar elemen yang bisa diedit (mis. Safari)
+  async function readClipboardImages() {
+    try {
+      const files = [];
+      for (const item of await navigator.clipboard.read()) {
+        const t = item.types.find(t => t.startsWith('image/'));
+        if (t) files.push(await item.getType(t));
+      }
+      if (files.length) pasteImages(files);
+    } catch (_) {}
+  }
+
+  const hasFiles = dt => !!dt && [...(dt.types || [])].includes('Files');
+  window.addEventListener('dragover', e => {
+    if (!hasFiles(e.dataTransfer)) return;      // seret teks biasa: biarkan perilaku bawaan
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+  window.addEventListener('drop', e => {
+    if (!hasFiles(e.dataTransfer)) return;
+    e.preventDefault();                         // jangan buka file di tab ini
+    const files = imageFiles(e.dataTransfer);
+    if (!files.length) return;
+    const [wx, wy] = toWorld(e.clientX, e.clientY);
+    placeImages(files, wx, wy, true);
+  });
+  window.addEventListener('dragstart', e => { if (e.target.closest && e.target.closest('.pic')) e.preventDefault(); });
+
+  /* =====================================================================
    * 9. toolbar & keyboard
    * ===================================================================== */
   bar.addEventListener('click', e => {
@@ -570,6 +796,10 @@
 
     const ctrl = e.ctrlKey || e.metaKey;
     if (ctrl && e.key.toLowerCase() === 's') { e.preventDefault(); saveNow(); return; }
+    if (ctrl && e.key.toLowerCase() === 'v' && !activeNote() && navigator.clipboard && navigator.clipboard.read) {
+      clearTimeout(pasteFallback);
+      pasteFallback = setTimeout(readClipboardImages, 150);   // dibatalkan kalau event paste datang
+    }
     // di dalam blok teks, Ctrl+Z tetap undo ketikan bawaan browser
     if (ctrl && !e.shiftKey && e.key.toLowerCase() === 'z' && !activeNote()) { e.preventDefault(); undo(); return; }
     if (e.key === 'Escape') {
