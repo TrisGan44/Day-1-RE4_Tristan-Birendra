@@ -39,6 +39,34 @@ Buat aplikasi catatan di mana pengguna bisa klik di mana saja untuk mengetik, me
 
 ## Output
 
-Berikan kode lengkap dalam satu file `index.html`, jelaskan secara singkat fungsi tiap bagian kode, cara membukanya di browser, dan cara menguji interaksi utamanya (mengetik, menggambar, menghapus, undo, menggeser papan, pintasan keyboard, dan penyimpanan setelah halaman dimuat ulang).
+Berikan kode lengkap dalam satu file `index.html` dan cara mengujinya secara singkat. Tidak perlu menjelaskan kodenya.
 
 Jangan mengklaim aplikasi sudah berfungsi sebelum kamu memeriksa perilakunya.
+
+## Update: Dukungan Gambar
+
+Tambahkan fitur gambar ke aplikasi catatan di index.html yang sudah ada, tanpa mengubah fitur lain.
+
+### Requirements
+
+- Ctrl+V (atau Cmd+V di Mac) dengan gambar di clipboard akan menempelkan gambar ke papan.
+- Gambar muncul di posisi klik terakhir, atau di tengah layar kalau belum pernah klik.
+- Kalau sedang mengetik di blok teks, menempel teks biasa tetap berjalan normal; hanya gambar yang jadi blok gambar.
+- Gambar juga bisa ditambahkan dengan drag & drop file gambar ke papan.
+- Gambar ikut bergeser bersama papan seperti teks dan coretan.
+- Gambar bisa dipindah dengan cara diseret di mode write.
+- Gambar bisa dihapus dengan mode erase atau Ctrl+klik, dan bisa dikembalikan dengan undo.
+- Gambar ikut tersimpan otomatis dan muncul lagi setelah halaman dimuat ulang.
+
+### Constraints
+
+- Tetap HTML, CSS, dan JavaScript murni dalam satu file.
+- Perkecil gambar besar (misalnya lebar maksimal 1200px) sebelum disimpan agar penyimpanan browser tidak cepat penuh.
+- Lebar tampilan gambar di papan maksimal sekitar 30rem, sama seperti blok teks.
+- Kalau penyimpanan browser penuh, aplikasi tidak boleh error; cukup gagal menyimpan dengan diam.
+
+### Output
+
+Berikan kode index.html lengkap yang sudah diperbarui dan cara menguji fitur gambar secara singkat. Tidak perlu menjelaskan kodenya.
+
+Jangan mengklaim fitur sudah berfungsi sebelum kamu memeriksa perilakunya.
