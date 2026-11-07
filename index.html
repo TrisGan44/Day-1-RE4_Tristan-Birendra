@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>gultik</title>
+<style>
+  /* ---------- tema: terang (default) dan gelap (ikut sistem) ---------- */
+  :root {
+    color-scheme: light dark;
+    --paper: #fbfaf7;
+    --ink:   #26231f;
+    --faint: #a9a294;
+    --serif: Charter, "Bitstream Charter", "Sitka Text", Cambria, Georgia, serif;
+    --sans:  system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --paper: #171614; --ink: #e6e2d8; --faint: #5f594e; }
+  }
+
+  /* ---------- halaman: tidak boleh scroll, hanya papan yang bergeser ---------- */
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
+    background: var(--paper); color: var(--ink);
+    -webkit-user-select: none; user-select: none;
+    touch-action: none; -webkit-tap-highlight-color: transparent;
+  }
+  #board { position: fixed; inset: 0; overflow: hidden; cursor: text; }
+  body[data-mode="draw"]  #board { cursor: crosshair; }
+  body[data-mode="erase"] #board { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='22'%3E%3Ccircle cx='11' cy='11' r='9.5' fill='none' stroke='%23888' stroke-width='1.2'/%3E%3C/svg%3E") 11 11, crosshair; }
+  body.panning #board { cursor: grabbing; }
+  #ink { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+  /* "dunia": ikut bergeser lewat transform; titik (0,0) dunia ada di sini */
+  #world { position: absolute; left: 0; top: 0; width: 0; height: 0; will-change: transform; }
+
+  /* ---------- blok teks ---------- */
+  .note {
+    position: absolute;
+    width: max-content; max-width: 30rem; min-width: 1ch;
+    margin-top: -.75em;                 /* setengah tinggi baris: caret tepat di titik klik */
+    font: 1.2rem/1.5 var(--serif);
+    color: var(--ink); caret-color: var(--ink);
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    outline: none; cursor: text;
+    -webkit-user-select: text; user-select: text;
+  }
+  /* di mode draw/erase, blok teks tidak menangkap pointer supaya coretan/hapus bisa lewat di atasnya */
+  body[data-mode="draw"] .note, body[data-mode="erase"] .note { pointer-events: none; }
+
+  /* ---------- petunjuk samar di tengah ---------- */
+  #hint {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    font: .8rem var(--sans); letter-spacing: .08em; color: var(--faint);
+    pointer-events: none; white-space: nowrap; transition: opacity .35s;
+  }
+  #hint.gone { opacity: 0; }
+
+  /* ---------- toolbar ---------- */
+  #bar { position: fixed; top: .6rem; left: .6rem; display: flex; gap: .1rem; z-index: 5; }
+  #bar button {
+    all: unset; box-sizing: border-box; cursor: pointer;
+    padding: .4rem .55rem; border-radius: .3rem;
+    font: .78rem var(--sans); letter-spacing: .08em; color: var(--faint);
+    transition: color .15s;
+  }
+  #bar button:hover { color: var(--ink); }
+  #bar button.on { color: var(--ink); }          /* tombol aktif lebih gelap */
+  #bar button:focus-visible { outline: 1px solid var(--faint); }
+  #bar button[hidden] { display: none; }
+</style>
+</head>
+<body data-mode="write">
+
+<div id="board">
+  <canvas id="ink"></canvas>
+  <div id="world"></div>
+</div>
+<div id="hint">click anywhere and type · drag to move around</div>
+<nav id="bar" aria-label="tools">
+  <button type="button" data-tool="write" title="write (alt)">write</button>
+  <button type="button" data-tool="draw"  title="draw (alt)">draw</button>
+  <button type="button" data-tool="erase" title="erase (hold ctrl and drag)">erase</button>
+  <button type="button" id="undo" title="undo (ctrl+z)" hidden>undo</button>
+</nav>
+
+<script>
+(() => {
+  'use strict';
+
+  /* =====================================================================
+   * 1. konstanta & state
+   * ===================================================================== */
+  const STORE_KEY = 'gultik.board.v1';
+  // kunci penyimpanan versi lama yang dicoba untuk migrasi (tebakan, lihat catatan di migrateLegacy)
+  const LEGACY_KEYS = ['gultik', 'gultik.notes', 'gultik-notes', 'gultik:notes', 'gultik.note', 'notes', 'note', 'catatan'];
+  const LINE_W = 2.4;        // tebal coretan (satuan dunia)
+  const ERASE_R = 9;         // radius penghapus
+  const TAP_SLOP = 4;        // geseran maksimum yang masih dihitung sebagai "klik"
+  const UNDO_LIMIT = 200;
+
+  const board = document.getElementById('board');
+  const canvas = document.getElementById('ink');
+  const ctx = canvas.getContext('2d');
+  const world = document.getElementById('world');
+  const hint = document.getElementById('hint');
+  const bar = document.getElementById('bar');
+  const undoBtn = document.getElementById('undo');
+
+  let view = { x: 0, y: 0 };          // posisi dunia di layar: layar = dunia + view
+  const notes = new Map();            // id -> { id, x, y, text, el }
+  let strokes = [];                   // [{ id, p: [[x,y],...], b: [minx,miny,maxx,maxy] }]
+  const undoStack = [];               // { type:'stroke', id } | { type:'erase', strokes:[], notes:[] }
+  let mode = 'write';                 // write | draw | erase
+  let dpr = 1;
+  let ink = '#26231f';
+
+  const uid = () => Math.random().toString(36).slice(2, 10);
+
+  /* =====================================================================
+   * 2. penyimpanan otomatis (localStorage) + migrasi data lama
+   * ===================================================================== */
+  let saveTimer = 0;
+  function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 400); }
+  function saveNow() {
+    clearTimeout(saveTimer);
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({
+        v: 1,
+        view: { x: view.x, y: view.y },
+        notes: [...notes.values()].map(n => ({ id: n.id, x: n.x, y: n.y, text: n.text })),
+        strokes: strokes.map(s => ({ id: s.id, p: s.p })),
+      }));
+    } catch (_) { /* penyimpanan penuh/diblokir: diam saja */ }
+  }
+
+  const num = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
+
+  function loadBoard() {
+    let raw = null;
+    try { raw = localStorage.getItem(STORE_KEY); } catch (_) {}
+    if (raw === null) { migrateLegacy(); return; }
+    try {
+      const d = JSON.parse(raw);
+      view.x = num(d.view && d.view.x); view.y = num(d.view && d.view.y);
+      for (const n of d.notes || []) {
+        if (n && typeof n.text === 'string') addNote(num(n.x), num(n.y), n.text, n.id);
+      }
+      for (const s of d.strokes || []) {
+        if (s && Array.isArray(s.p) && s.p.length) {
+          const p = s.p.map(q => [num(q[0]), num(q[1])]);
+          strokes.push({ id: s.id || uid(), p, b: bboxOf(p) });
+        }
+      }
+    } catch (_) { /* data rusak: mulai dari papan kosong */ }
+  }
+
+  /* Migrasi: formatnya versi lama tidak ada di repo, jadi ini TEBAKAN yang longgar.
+   * Menerima string biasa, array string, atau objek/array objek { text, x?, y? }.
+   * Data lama tidak dihapus; setelah papan baru tersimpan, migrasi tidak jalan lagi. */
+  function migrateLegacy() {
+    let found = [];
+    for (const key of LEGACY_KEYS) {
+      let raw = null;
+      try { raw = localStorage.getItem(key); } catch (_) {}
+      if (!raw) continue;
+      let data = raw;
+      try { data = JSON.parse(raw); } catch (_) {}
+      const list = Array.isArray(data) ? data : (data && Array.isArray(data.notes) ? data.notes : [data]);
+      for (const item of list) {
+        if (typeof item === 'string' && item.trim()) found.push({ text: item });
+        else if (item && typeof item.text === 'string' && item.text.trim()) found.push(item);
+      }
+      if (found.length) break;
+    }
+    if (!found.length) return;
+    let y = 0;
+    for (const it of found) {
+      const hasPos = typeof it.x === 'number' && typeof it.y === 'number';
+      addNote(hasPos ? it.x : 0, hasPos ? it.y : y, it.text);
+      if (!hasPos) y += (it.text.split('\n').length + 1.5) * 29;   // susun ke bawah kalau tak ada posisi
+    }
+    saveNow();
+  }
+
+  /* =====================================================================
+   * 3. blok teks
+   * ===================================================================== */
+  const plainSupported = (() => {
+    const t = document.createElement('div');
+    try { t.contentEditable = 'plaintext-only'; } catch (_) {}
+    return t.contentEditable === 'plaintext-only';
+  })();
+
+  function addNote(x, y, text = '', id = uid()) {
+    const el = document.createElement('div');
+    el.className = 'note';
+    el.contentEditable = plainSupported ? 'plaintext-only' : 'true';
+    el.spellcheck = false;
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
+    el.textContent = text;
+    const n = { id, x, y, text, el };
+    notes.set(id, n);
+    world.appendChild(el);
+
+    el.addEventListener('input', () => {
+      n.text = plainSupported ? el.textContent : el.innerText;
+      updateHint(); scheduleSave();
+    });
+    // tempel sebagai teks polos saja
+    el.addEventListener('paste', e => {
+      e.preventDefault();
+      document.execCommand('insertText', false, (e.clipboardData || window.clipboardData).getData('text'));
+    });
+    // blok kosong otomatis terhapus saat kehilangan fokus
+    el.addEventListener('blur', () => {
+      if (!notes.has(id)) return;
+      if (n.text.trim() === '') removeNote(id);
+      scheduleSave();
+    });
+    updateHint();
+    return n;
+  }
+
+  function removeNote(id) {
+    const n = notes.get(id);
+    if (!n) return;
+    notes.delete(id);          // hapus dari model dulu supaya handler blur tidak berulang
+    n.el.remove();
+    updateHint();
+  }
+
+  const noteRect = n => ({ x0: n.el.offsetLeft, y0: n.el.offsetTop, x1: n.el.offsetLeft + n.el.offsetWidth, y1: n.el.offsetTop + n.el.offsetHeight });
+  const activeNote = () => { const a = document.activeElement; return a && a.classList && a.classList.contains('note') ? a : null; };
+  const blurActive = () => { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); };
+
+  // petunjuk hilang begitu ada isi di papan
+  function updateHint() { hint.classList.toggle('gone', notes.size > 0 || strokes.length > 0); }
+
+  /* =====================================================================
+   * 4. canvas: coretan (hanya bagian yang terlihat yang digambar)
+   * ===================================================================== */
+  function bboxOf(p) {
+    let a = Infinity, b = Infinity, c = -Infinity, d = -Infinity;
+    for (const q of p) { if (q[0] < a) a = q[0]; if (q[0] > c) c = q[0]; if (q[1] < b) b = q[1]; if (q[1] > d) d = q[1]; }
+    return [a, b, c, d];
+  }
+
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(innerWidth * dpr);
+    canvas.height = Math.round(innerHeight * dpr);
+    requestDraw();
+  }
+
+  function readColors() { ink = getComputedStyle(document.documentElement).getPropertyValue('--ink').trim() || ink; }
+
+  let rafId = 0;
+  function requestDraw() { if (!rafId) rafId = requestAnimationFrame(draw); }
+
+  function draw() {
+    rafId = 0;
+    const rx = Math.round(view.x), ry = Math.round(view.y);
+    world.style.transform = `translate(${rx}px, ${ry}px)`;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr, 0, 0, dpr, rx * dpr, ry * dpr);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.lineWidth = LINE_W; ctx.strokeStyle = ink; ctx.fillStyle = ink;
+    // batas area terlihat dalam koordinat dunia
+    const x0 = -rx - LINE_W, y0 = -ry - LINE_W, x1 = -rx + innerWidth + LINE_W, y1 = -ry + innerHeight + LINE_W;
+    for (const s of strokes) {
+      const b = s.b;
+      if (b[2] < x0 || b[0] > x1 || b[3] < y0 || b[1] > y1) continue;   // di luar layar: lewati
+      drawStroke(s.p);
+    }
+  }
+
+  // garis halus: kuadratik lewat titik-tengah antar titik sampel
+  function drawStroke(p) {
+    ctx.beginPath();
+    if (p.length === 1) {                       // satu ketukan = titik kecil
+      ctx.arc(p[0][0], p[0][1], LINE_W * 0.75, 0, Math.PI * 2);
+      ctx.fill();
+      return;
+    }
+    ctx.moveTo(p[0][0], p[0][1]);
+    for (let i = 1; i < p.length - 1; i++) {
+      ctx.quadraticCurveTo(p[i][0], p[i][1], (p[i][0] + p[i + 1][0]) / 2, (p[i][1] + p[i + 1][1]) / 2);
+    }
+    ctx.lineTo(p[p.length - 1][0], p[p.length - 1][1]);
+    ctx.stroke();
+  }
+
+  /* =====================================================================
+   * 5. undo
+   * ===================================================================== */
+  function pushUndo(a) {
+    undoStack.push(a);
+    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+    undoBtn.hidden = false;
+  }
+
+  function undo() {
+    const a = undoStack.pop();
+    undoBtn.hidden = undoStack.length === 0;
+    if (!a) return;
+    if (a.type === 'stroke') {
+      strokes = strokes.filter(s => s.id !== a.id);
+    } else {                                    // batalkan penghapusan: kembalikan coretan & teks
+      for (const r of a.strokes) strokes.splice(Math.min(r.idx, strokes.length), 0, r.s);
+      for (const n of a.notes) addNote(n.x, n.y, n.text, n.id);
+    }
+    updateHint(); requestDraw(); scheduleSave();
+  }
+
+  /* =====================================================================
+   * 6. penghapus
+   * ===================================================================== */
+  function segDist2(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    let t = l2 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const cx = ax + t * dx - px, cy = ay + t * dy - py;
+    return cx * cx + cy * cy;
+  }
+
+  // hapus apa pun yang tersentuh ruas (a -> b) dalam koordinat dunia; hasilnya dicatat di rec
+  function eraseSegment(ax, ay, bx, by, rec) {
+    const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / 4));
+    const pts = [];
+    for (let i = 0; i <= n; i++) pts.push([ax + (bx - ax) * i / n, ay + (by - ay) * i / n]);
+    const minx = Math.min(ax, bx) - ERASE_R, maxx = Math.max(ax, bx) + ERASE_R;
+    const miny = Math.min(ay, by) - ERASE_R, maxy = Math.max(ay, by) + ERASE_R;
+    const r2 = (ERASE_R + LINE_W / 2) ** 2;
+    let changed = false;
+
+    for (let i = strokes.length - 1; i >= 0; i--) {
+      const s = strokes[i], b = s.b;
+      if (b[2] < minx || b[0] > maxx || b[3] < miny || b[1] > maxy) continue;
+      let hit = false;
+      for (let k = 0; k < pts.length && !hit; k++) {
+        const [px, py] = pts[k];
+        if (s.p.length === 1) hit = (s.p[0][0] - px) ** 2 + (s.p[0][1] - py) ** 2 <= r2;
+        else for (let j = 0; j < s.p.length - 1; j++) {
+          if (segDist2(px, py, s.p[j][0], s.p[j][1], s.p[j + 1][0], s.p[j + 1][1]) <= r2) { hit = true; break; }
+        }
+      }
+      if (hit) { rec.strokes.push({ idx: i, s }); strokes.splice(i, 1); changed = true; }
+    }
+
+    for (const n of [...notes.values()]) {
+      const r = noteRect(n);
+      if (r.x1 < minx || r.x0 > maxx || r.y1 < miny || r.y0 > maxy) continue;
+      const hit = pts.some(([px, py]) => px >= r.x0 - 4 && px <= r.x1 + 4 && py >= r.y0 - 4 && py <= r.y1 + 4);
+      if (hit) { rec.notes.push({ id: n.id, x: n.x, y: n.y, text: n.text }); removeNote(n.id); changed = true; }
+    }
+    if (changed) { updateHint(); requestDraw(); }
+  }
+
+  function commitErase(rec) {
+    if (!rec.strokes.length && !rec.notes.length) return;
+    rec.strokes.sort((a, b) => a.idx - b.idx);   // dikembalikan dari indeks kecil ke besar
+    pushUndo({ type: 'erase', strokes: rec.strokes, notes: rec.notes });
+    scheduleSave();
+  }
+
+  /* =====================================================================
+   * 7. menggeser papan (drag, tengah mouse, scroll, dua jari) + tombol Home
+   * ===================================================================== */
+  let anim = 0;
+  function panBy(dx, dy) {
+    cancelAnimationFrame(anim);
+    view.x += dx; view.y += dy;
+    requestDraw(); scheduleSave();
+  }
+
+  function goHome() {
+    let b = null;
+    const add = (x0, y0, x1, y1) => { b = b ? [Math.min(b[0], x0), Math.min(b[1], y0), Math.max(b[2], x1), Math.max(b[3], y1)] : [x0, y0, x1, y1]; };
+    for (const n of notes.values()) { const r = noteRect(n); add(r.x0, r.y0, r.x1, r.y1); }
+    for (const s of strokes) add(s.b[0], s.b[1], s.b[2], s.b[3]);
+    let tx = 0, ty = 0;
+    if (b) {
+      const M = 48, w = b[2] - b[0], h = b[3] - b[1];
+      tx = w <= innerWidth - 2 * M ? innerWidth / 2 - (b[0] + w / 2) : M - b[0];   // muat: tengahkan; besar: ratakan kiri-atas
+      ty = h <= innerHeight - 2 * M ? innerHeight / 2 - (b[1] + h / 2) : M - b[1];
+    }
+    const sx = view.x, sy = view.y, t0 = performance.now();
+    cancelAnimationFrame(anim);
+    const step = now => {
+      const t = Math.min(1, (now - t0) / 280), e = 1 - (1 - t) ** 3;
+      view.x = sx + (tx - sx) * e; view.y = sy + (ty - sy) * e;
+      requestDraw();
+      if (t < 1) anim = requestAnimationFrame(step); else scheduleSave();
+    };
+    anim = requestAnimationFrame(step);
+  }
+
+  /* =====================================================================
+   * 8. pointer: write / draw / erase / pan (mouse, touchpad, sentuh, stylus)
+   * ===================================================================== */
+  const touches = new Map();          // pointerId -> {x,y} (hanya jari)
+  let twoPan = null;                  // { x, y }: titik tengah dua jari sebelumnya
+  let g = null;                       // gestur aktif: { id, kind: tap|pan|draw|erase, ... }
+
+  const toWorld = (cx, cy) => [cx - view.x, cy - view.y];
+  const inBar = e => e.target.closest && e.target.closest('#bar');
+
+  function paintToolbar(tool) {
+    for (const b of bar.querySelectorAll('[data-tool]')) b.classList.toggle('on', b.dataset.tool === tool);
+  }
+
+  function setMode(m) {
+    mode = m;
+    document.body.dataset.mode = m;
+    paintToolbar(m);
+    if (m !== 'write') blurActive();
+  }
+
+  function endGesture(cancel) {
+    if (!g) return;
+    const gg = g; g = null;
+    document.body.classList.remove('panning');
+    paintToolbar(mode);
+    if (gg.kind === 'draw') {
+      if (cancel) { strokes = strokes.filter(s => s !== gg.stroke); requestDraw(); }
+      else { pushUndo({ type: 'stroke', id: gg.stroke.id }); scheduleSave(); }
+    } else if (gg.kind === 'erase') {
+      commitErase(gg.rec);
+    } else if (gg.kind === 'tap' && !cancel) {
+      // klik tanpa geser di area kosong: buat blok teks baru di titik itu dan fokuskan
+      const [wx, wy] = toWorld(gg.sx, gg.sy);
+      const n = addNote(Math.round(wx), Math.round(wy));
+      n.el.focus();
+      scheduleSave();
+    }
+  }
+
+  window.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch' && !inBar(e)) {
+      touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (touches.size === 2) {                 // dua jari: geser papan, batalkan gestur satu jari
+        if (g) endGesture(true);
+        const [a, b] = [...touches.values()];
+        twoPan = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+        e.preventDefault();
+        return;
+      }
+      if (touches.size > 2) return;
+    }
+    if (g) return;
+
+    // klik tengah mouse: geser dari mana saja (termasuk di atas toolbar atau teks)
+    if (e.button === 1) {
+      e.preventDefault();
+      g = { id: e.pointerId, kind: 'pan', lx: e.clientX, ly: e.clientY };
+      document.body.classList.add('panning');
+      try { board.setPointerCapture(e.pointerId); } catch (_) {}
+      return;
+    }
+    if (inBar(e)) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+    // Ctrl + klik/seret = hapus sekali gerakan; ujung stylus bagian penghapus juga
+    const tool = (e.ctrlKey || e.button === 5 || (e.buttons & 32)) ? 'erase' : mode;
+    if (tool === 'write' && e.target.closest('.note')) return;   // biarkan browser mengedit teks
+
+    try { board.setPointerCapture(e.pointerId); } catch (_) {}
+    const [wx, wy] = toWorld(e.clientX, e.clientY);
+    if (tool === 'write') {
+      blurActive();
+      g = { id: e.pointerId, kind: 'tap', sx: e.clientX, sy: e.clientY, lx: e.clientX, ly: e.clientY };
+    } else if (tool === 'draw') {
+      blurActive();
+      const p = [[+wx.toFixed(1), +wy.toFixed(1)]];
+      const stroke = { id: uid(), p, b: bboxOf(p) };
+      strokes.push(stroke);
+      g = { id: e.pointerId, kind: 'draw', stroke };
+      updateHint(); requestDraw();
+    } else {
+      g = { id: e.pointerId, kind: 'erase', lx: wx, ly: wy, rec: { strokes: [], notes: [] } };
+      paintToolbar('erase');
+      eraseSegment(wx, wy, wx, wy, g.rec);
+    }
+  }, true);
+
+  window.addEventListener('pointermove', e => {
+    if (touches.has(e.pointerId)) touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (twoPan) {
+      if (touches.size >= 2) {
+        const [a, b] = [...touches.values()];
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        panBy(mx - twoPan.x, my - twoPan.y);
+        twoPan = { x: mx, y: my };
+      }
+      return;
+    }
+    if (!g || g.id !== e.pointerId) return;
+
+    if (g.kind === 'tap') {
+      if (Math.hypot(e.clientX - g.sx, e.clientY - g.sy) <= TAP_SLOP) return;
+      g.kind = 'pan';                           // diseret: jadi geser papan, bukan blok teks
+      document.body.classList.add('panning');
+    }
+    if (g.kind === 'pan') {
+      panBy(e.clientX - g.lx, e.clientY - g.ly);
+      g.lx = e.clientX; g.ly = e.clientY;
+    } else if (g.kind === 'draw') {
+      const evs = (e.getCoalescedEvents && e.getCoalescedEvents()) || [];
+      const s = g.stroke;
+      for (const ev of evs.length ? evs : [e]) {
+        const [wx, wy] = toWorld(ev.clientX, ev.clientY);
+        const last = s.p[s.p.length - 1];
+        if (Math.hypot(wx - last[0], wy - last[1]) < 1) continue;   // abaikan getaran kecil
+        s.p.push([+wx.toFixed(1), +wy.toFixed(1)]);
+      }
+      s.b = bboxOf(s.p);
+      requestDraw();
+    } else if (g.kind === 'erase') {
+      const [wx, wy] = toWorld(e.clientX, e.clientY);
+      eraseSegment(g.lx, g.ly, wx, wy, g.rec);
+      g.lx = wx; g.ly = wy;
+    }
+  }, true);
+
+  const pointerEnd = cancel => e => {
+    touches.delete(e.pointerId);
+    if (touches.size < 2) twoPan = null;
+    if (g && g.id === e.pointerId) endGesture(cancel);
+  };
+  window.addEventListener('pointerup', pointerEnd(false), true);
+  window.addEventListener('pointercancel', pointerEnd(true), true);
+
+  // cegah pemilihan teks/fokus dan autoscroll browser untuk Ctrl+klik dan klik tengah
+  window.addEventListener('mousedown', e => {
+    if (e.button === 1 || (e.ctrlKey && !inBar(e))) e.preventDefault();
+  }, true);
+  window.addEventListener('auxclick', e => { if (e.button === 1) e.preventDefault(); }, true);
+
+  // scroll mouse / touchpad menggeser papan
+  window.addEventListener('wheel', e => {
+    if (e.ctrlKey) return;                      // biarkan zoom bawaan browser
+    e.preventDefault();
+    const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
+    let dx = e.deltaX * k, dy = e.deltaY * k;
+    if (e.shiftKey && !dx) { dx = dy; dy = 0; }
+    panBy(-dx, -dy);
+  }, { passive: false });
+
+  /* =====================================================================
+   * 9. toolbar & keyboard
+   * ===================================================================== */
+  bar.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.id === 'undo') undo(); else setMode(b.dataset.tool);
+    b.blur();
+  });
+
+  let altClean = false;               // Alt ditekan sendirian (tanpa tombol lain)?
+  window.addEventListener('keydown', e => {
+    if (e.key === 'Alt') {
+      e.preventDefault();               // cegah menu browser menangkap Alt
+      if (!e.repeat) altClean = true;
+      return;
+    }
+    altClean = false;
+
+    const ctrl = e.ctrlKey || e.metaKey;
+    if (ctrl && e.key.toLowerCase() === 's') { e.preventDefault(); saveNow(); return; }
+    // di dalam blok teks, Ctrl+Z tetap undo ketikan bawaan browser
+    if (ctrl && !e.shiftKey && e.key.toLowerCase() === 'z' && !activeNote()) { e.preventDefault(); undo(); return; }
+    if (e.key === 'Escape') {
+      if (activeNote()) blurActive(); else if (mode !== 'write') setMode('write');
+      return;
+    }
+    if (e.key === 'Home' && !ctrl && !activeNote()) { e.preventDefault(); goHome(); }
+  }, true);
+
+  window.addEventListener('keyup', e => {
+    if (e.key !== 'Alt') return;
+    e.preventDefault();
+    if (altClean) setMode(mode === 'draw' ? 'write' : 'draw');
+    altClean = false;
+  }, true);
+  window.addEventListener('blur', () => { altClean = false; });
+
+  /* =====================================================================
+   * 10. start
+   * ===================================================================== */
+  readColors();
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readColors(); requestDraw(); });
+  addEventListener('resize', resize);
+  addEventListener('pagehide', saveNow);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) saveNow(); });
+
+  loadBoard();
+  updateHint();
+  paintToolbar(mode);
+  resize();
+})();
+</script>
+</body>
+</html>
